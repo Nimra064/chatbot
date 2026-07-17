@@ -18,19 +18,19 @@ def chat_fn(message: str, history: List[Any]) -> str:
       - "messages":  [{"role": "user"|"assistant", "content": "..."}]
       - "tuples":    [(user_msg, bot_msg), ...]
     """
-    api_history: List[Dict[str, str]] = []
-    for item in history or []:
-        if isinstance(item, dict):
-            role = item.get("role")
-            content = item.get("content") or ""
-            if role in ("user", "assistant") and content:
-                api_history.append({"role": role, "content": content})
-        elif isinstance(item, (list, tuple)) and len(item) == 2:
-            user_msg, bot_msg = item
-            if user_msg:
-                api_history.append({"role": "user", "content": str(user_msg)})
-            if bot_msg:
-                api_history.append({"role": "assistant", "content": str(bot_msg)})
+    # api_history: List[Dict[str, str]] = []
+    # for item in history or []:
+    #     if isinstance(item, dict):
+    #         role = item.get("role")
+    #         content = item.get("content") or ""
+    #         if role in ("user", "assistant") and content:
+    #             api_history.append({"role": role, "content": content})
+    #     elif isinstance(item, (list, tuple)) and len(item) == 2:
+    #         user_msg, bot_msg = item
+    #         if user_msg:
+    #             api_history.append({"role": "user", "content": str(user_msg)})
+    #         if bot_msg:
+    #             api_history.append({"role": "assistant", "content": str(bot_msg)})
 
     try:
         resp = requests.post(
