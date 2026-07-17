@@ -74,3 +74,6 @@ Response:
   "timestamp": "2026-07-17T12:00:00"
 }
 ```
+
+
+<!-- test: trigger auto-PR + Copilot review -->
