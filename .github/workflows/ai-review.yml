@@ -11,7 +11,9 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: read
+  # 'contents: write' is required for createCommitComment on push events.
+  # 'pull-requests: write' + 'issues: write' cover PR comments.
+  contents: write
   pull-requests: write
   issues: write
 
