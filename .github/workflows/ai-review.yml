@@ -171,7 +171,6 @@ jobs:
           echo "Diff bytes: $(wc -c < diff.patch 2>/dev/null || echo 0)"
 
       # ------------------------------------------------------------------
-      # AGENTIC REVIEW — tool-using LLM against the running app + repo.
       # Runs even if smoke failed so the agent can explain what broke.
       # ------------------------------------------------------------------
       - name: Agentic review with Gemini
