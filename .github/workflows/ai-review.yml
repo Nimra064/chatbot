@@ -1,7 +1,15 @@
-name: AI Code Review
+name: AI Code Review (Agentic)
 
-# Every step is resilient. The "post comment" step runs even if earlier
-# steps failed, so you always see WHY on the commit / PR.
+# End-to-end agentic pipeline:
+#   1. install deps
+#   2. start backend + frontend in the background ("terminals" 1 & 2)
+#   3. deterministic smoke: hit every endpoint
+#   4. build git diff
+#   5. run the tool-using Gemini AGENT against the running app + repo
+#   6. post a PR / commit comment with the structured verdict
+#   7. stop the services (both terminals disconnect)
+#   8. gate: fail the check if smoke failed OR the agent said "block"
+#   9. email collaborators on failure
 
 on:
   push:
@@ -11,15 +19,16 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  # 'contents: write' is required for createCommitComment on push events.
-  # 'pull-requests: write' + 'issues: write' cover PR comments.
-  contents: write
+  contents: write        # needed for createCommitComment on push events
   pull-requests: write
   issues: write
 
 jobs:
   review:
     runs-on: ubuntu-latest
+    env:
+      BACKEND_URL: http://127.0.0.1:8000
+      FRONTEND_URL: http://127.0.0.1:7860
     steps:
       - name: Checkout
         id: checkout
@@ -40,169 +49,107 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install google-genai
 
       # ------------------------------------------------------------------
-      # Smoke test — run the WHOLE app end-to-end:
-      #   * start FastAPI backend  in a background "terminal"
-      #   * start Gradio frontend in a background "terminal"
-      #   * hit every backend endpoint (GET /, GET /health, POST /chat)
-      #   * hit the frontend root and its Gradio /config endpoint
-      #   * any non-2xx / bad body -> fail the workflow (PR check goes red)
-      #   * both background processes are killed at the end either way
+      # Start the two services in the background. PIDs are written to
+      # disk so the "Stop services" step can clean them up on ANY exit.
       # ------------------------------------------------------------------
-      - name: Smoke test — run whole app & hit every endpoint
-        id: smoke
-        # Do NOT continue-on-error: if the app is broken, the PR must fail.
+      - name: Start services (backend + frontend)
+        id: start_services
         run: |
           set +e
-          FAIL=0
-          BACKEND_URL="http://127.0.0.1:8000"
-          FRONTEND_URL="http://127.0.0.1:7860"
-
-          # Kill background procs on any exit path (success OR failure).
-          cleanup() {
-            echo "::group::Cleanup — stop backend & frontend"
-            [ -n "$UVICORN_PID" ] && kill "$UVICORN_PID" 2>/dev/null || true
-            [ -n "$GRADIO_PID"  ] && kill "$GRADIO_PID"  2>/dev/null || true
-            # Give them a moment to close ports cleanly.
-            sleep 1
-            [ -n "$UVICORN_PID" ] && kill -9 "$UVICORN_PID" 2>/dev/null || true
-            [ -n "$GRADIO_PID"  ] && kill -9 "$GRADIO_PID"  2>/dev/null || true
-            echo "Both terminals disconnected."
-            echo "::endgroup::"
-          }
-          trap cleanup EXIT
-
-          # ================================================================
-          # 1. Start backend (terminal 1)
-          # ================================================================
           echo "::group::Terminal 1 — start backend (uvicorn :8000)"
           nohup uvicorn backend.main:app --host 127.0.0.1 --port 8000 \
                 > uvicorn.log 2>&1 &
-          UVICORN_PID=$!
-          echo "uvicorn PID=$UVICORN_PID"
+          echo $! > uvicorn.pid
+          echo "uvicorn PID=$(cat uvicorn.pid)"
 
           BACKEND_UP=0
           for i in $(seq 1 20); do
             if curl -fsS "$BACKEND_URL/health" > health.json 2>/dev/null; then
-              BACKEND_UP=1
-              break
+              BACKEND_UP=1; break
             fi
             sleep 1
           done
           if [ "$BACKEND_UP" -ne 1 ]; then
-            echo "::error title=Backend failed to start::uvicorn did not respond on $BACKEND_URL/health"
+            echo "::error title=Backend failed to start::did not respond on $BACKEND_URL/health"
             echo "---uvicorn.log---"; cat uvicorn.log || true
-            FAIL=1
+            echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
+            exit 1
           fi
           echo "::endgroup::"
 
-          # ================================================================
-          # 2. Start frontend (terminal 2)
-          # ================================================================
-          if [ "$FAIL" -eq 0 ]; then
-            echo "::group::Terminal 2 — start frontend (Gradio :7860)"
-            BACKEND_URL="$BACKEND_URL" \
-              nohup python frontend/app.py > gradio.log 2>&1 &
-            GRADIO_PID=$!
-            echo "gradio PID=$GRADIO_PID"
+          echo "::group::Terminal 2 — start frontend (Gradio :7860)"
+          BACKEND_URL="$BACKEND_URL" \
+            nohup python frontend/app.py > gradio.log 2>&1 &
+          echo $! > gradio.pid
+          echo "gradio PID=$(cat gradio.pid)"
 
-            FRONTEND_UP=0
-            for i in $(seq 1 30); do
-              if curl -fsS -o /dev/null "$FRONTEND_URL/"; then
-                FRONTEND_UP=1
-                break
-              fi
-              sleep 1
-            done
-            if [ "$FRONTEND_UP" -ne 1 ]; then
-              echo "::error title=Frontend failed to start::Gradio did not respond on $FRONTEND_URL/"
-              echo "---gradio.log---"; cat gradio.log || true
-              FAIL=1
+          FRONTEND_UP=0
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$FRONTEND_URL/"; then
+              FRONTEND_UP=1; break
             fi
-            echo "::endgroup::"
-          fi
-
-          # ================================================================
-          # 3. Exercise every backend endpoint
-          # ================================================================
-          if [ "$FAIL" -eq 0 ]; then
-            echo "::group::Exercise backend endpoints"
-
-            # Helper: check_http <method> <url> [json-body] <expected-substring>
-            check_http() {
-              local method="$1" url="$2" body="$3" expect="$4"
-              local out code
-              if [ -n "$body" ]; then
-                out=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" \
-                          -H "Content-Type: application/json" \
-                          --data "$body" "$url")
-              else
-                out=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" "$url")
-              fi
-              code="$out"
-              echo "--> $method $url  =>  HTTP $code"
-              cat resp.txt; echo
-              if [ "$code" != "200" ]; then
-                echo "::error title=Endpoint failed::$method $url returned HTTP $code"
-                FAIL=1
-                return
-              fi
-              if [ -n "$expect" ] && ! grep -q "$expect" resp.txt; then
-                echo "::error title=Bad response body::$method $url response did not contain '$expect'"
-                FAIL=1
-              fi
-            }
-
-            check_http GET  "$BACKEND_URL/"        ""                                                    "Agentic AI Chatbot"
-            check_http GET  "$BACKEND_URL/health"  ""                                                    "healthy"
-            check_http POST "$BACKEND_URL/chat"    '{"message":"hi","history":[]}'                        "\"reply\""
-            check_http POST "$BACKEND_URL/chat"    '{"message":"what is your name?","history":[]}'       "\"model\""
-
-            echo "::endgroup::"
-          fi
-
-          # ================================================================
-          # 4. Exercise the frontend (Gradio serves /config as JSON once up)
-          # ================================================================
-          if [ "$FAIL" -eq 0 ]; then
-            echo "::group::Exercise frontend"
-            code=$(curl -sS -o /dev/null -w "%{http_code}" "$FRONTEND_URL/")
-            echo "--> GET $FRONTEND_URL/  =>  HTTP $code"
-            if [ "$code" != "200" ]; then
-              echo "::error title=Frontend root failed::GET / returned HTTP $code"
-              FAIL=1
-            fi
-            # /config is Gradio's internal JSON descriptor — proves the app graph loaded.
-            code=$(curl -sS -o /dev/null -w "%{http_code}" "$FRONTEND_URL/config")
-            echo "--> GET $FRONTEND_URL/config  =>  HTTP $code"
-            if [ "$code" != "200" ]; then
-              echo "::warning title=Gradio /config not 200::got HTTP $code (non-fatal)"
-            fi
-            echo "::endgroup::"
-          fi
-
-          # ================================================================
-          # 5. Verdict
-          # ================================================================
-          if [ "$FAIL" -eq 0 ]; then
-            echo "All endpoints returned OK — whole app is healthy."
-            echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
-            exit 0
-          else
-            echo "One or more endpoints failed — see errors above."
+            sleep 1
+          done
+          if [ "$FRONTEND_UP" -ne 1 ]; then
+            echo "::error title=Frontend failed to start::did not respond on $FRONTEND_URL/"
+            echo "---gradio.log---"; cat gradio.log || true
             echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
-            echo "---uvicorn.log (tail)---"; tail -n 80 uvicorn.log 2>/dev/null || true
-            echo "---gradio.log  (tail)---"; tail -n 80 gradio.log  2>/dev/null || true
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "Both services are up and running."
+
+      # ------------------------------------------------------------------
+      # Deterministic endpoint smoke test.
+      # ------------------------------------------------------------------
+      - name: Smoke test — hit every endpoint
+        id: smoke
+        run: |
+          set +e
+          FAIL=0
+          check_http() {
+            local method="$1" url="$2" body="$3" expect="$4"
+            local code
+            if [ -n "$body" ]; then
+              code=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" \
+                        -H "Content-Type: application/json" --data "$body" "$url")
+            else
+              code=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" "$url")
+            fi
+            echo "--> $method $url  =>  HTTP $code"
+            cat resp.txt; echo
+            if [ "$code" != "200" ]; then
+              echo "::error title=Endpoint failed::$method $url returned HTTP $code"
+              FAIL=1; return
+            fi
+            if [ -n "$expect" ] && ! grep -q "$expect" resp.txt; then
+              echo "::error title=Bad response body::$method $url did not contain '$expect'"
+              FAIL=1
+            fi
+          }
+
+          check_http GET  "$BACKEND_URL/"        ""                                              "Agentic AI Chatbot"
+          check_http GET  "$BACKEND_URL/health"  ""                                              "healthy"
+          check_http POST "$BACKEND_URL/chat"    '{"message":"hi","history":[]}'                  "\"reply\""
+          check_http POST "$BACKEND_URL/chat"    '{"message":"what is your name?","history":[]}' "\"model\""
+          check_http GET  "$FRONTEND_URL/"       ""                                              ""
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
+          else
+            echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
             exit 1
           fi
 
       # ------------------------------------------------------------------
-      # Build diff
+      # Build the diff the agent will review.
       # ------------------------------------------------------------------
       - name: Build diff
         id: diff
-        # Always run — even if smoke failed — so the comment shows what changed.
         if: always()
         continue-on-error: true
         run: |
@@ -214,127 +161,42 @@ jobs:
             BASE="${{ github.event.before }}"
             HEAD="${{ github.event.after }}"
           fi
-
           if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             git diff --unified=3 $(git hash-object -t tree /dev/null) "$HEAD" > diff.patch 2>diff_error.log
           else
             git diff --unified=3 "$BASE" "$HEAD" > diff.patch 2>diff_error.log
           fi
-
           head -c 60000 diff.patch > diff.trimmed 2>/dev/null || true
           mv diff.trimmed diff.patch 2>/dev/null || true
           echo "Diff bytes: $(wc -c < diff.patch 2>/dev/null || echo 0)"
 
-      - name: Install Gemini SDK
-        id: install_sdk
-        if: always()
-        continue-on-error: true
-        run: pip install google-genai
-
-      - name: AI review with Gemini
-        id: ai
+      # ------------------------------------------------------------------
+      # AGENTIC REVIEW — tool-using LLM against the running app + repo.
+      # Runs even if smoke failed so the agent can explain what broke.
+      # ------------------------------------------------------------------
+      - name: Agentic review with Gemini
+        id: agent
         if: always()
         continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-flash-latest' }}
-        run: |
-          python <<'PY' 2> ai_error.log || true
-          import os, pathlib, textwrap, traceback
-
-          try:
-              api_key = os.environ.get("GEMINI_API_KEY")
-              if not api_key:
-                  pathlib.Path("review.md").write_text(
-                      "> ⚠️ **AI review skipped** — `GEMINI_API_KEY` secret is not set.\n"
-                      "> Add it at **Settings → Secrets and variables → Actions → New repository secret**."
-                  )
-                  raise SystemExit(0)
-
-              from google import genai
-
-              rules_path = pathlib.Path(".github/copilot-instructions.md")
-              rules_text = rules_path.read_text(encoding="utf-8") if rules_path.exists() else "(no rules file)"
-              diff_path = pathlib.Path("diff.patch")
-              diff = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
-              if not diff.strip():
-                  pathlib.Path("review.md").write_text("_No diff to review._")
-                  raise SystemExit(0)
-
-              prompt = textwrap.dedent(f"""
-              You are a senior code reviewer for a FastAPI + Gradio + Gemini demo.
-              Follow the review rules below EXACTLY. Only flag issues the rules
-              tell you to flag. Be terse.
-
-              ===== REVIEW RULES =====
-              {rules_text}
-
-              ===== DIFF =====
-              {diff}
-
-              ===== OUTPUT FORMAT =====
-              Return Markdown with these sections (omit if empty):
-              ### [security]
-              - <issue> — file:line
-              ### [bug]
-              - <issue> — file:line
-              ### [style]
-              - <issue> — file:line
-              ### Summary
-              One or two sentences. If nothing to flag, say "LGTM".
-              """).strip()
-
-              client = genai.Client(api_key=api_key)
-              resp = client.models.generate_content(
-                  model=os.environ.get("GEMINI_MODEL", "gemini-flash-latest"),
-                  contents=prompt,
-              )
-              review = (resp.text or "").strip() or "_(Gemini returned no content.)_"
-              pathlib.Path("review.md").write_text(review, encoding="utf-8")
-              print(review)
-
-              # Decide whether the review contains blocking findings.
-              # A section header like "### [security]" or "### [bug]" that is
-              # followed by at least one bullet counts as blocking.
-              import re
-              blocking = False
-              for tag in ("security", "bug"):
-                  pattern = (
-                      rf"^#+\s*\[{tag}\]\s*$"
-                      r"(?P<body>.*?)"
-                      r"(?=^#+\s|\Z)"
-                  )
-                  m = re.search(pattern, review, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
-                  if m and re.search(r"^\s*[-*]\s+\S", m.group("body"), flags=re.MULTILINE):
-                      blocking = True
-                      break
-              pathlib.Path("review_blocking.txt").write_text("1" if blocking else "0")
-              print(f"BLOCKING={blocking}")
-          except SystemExit:
-              raise
-          except Exception as e:
-              tb = traceback.format_exc()
-              pathlib.Path("review.md").write_text(
-                  f"> ❌ **AI review errored:**\n\n```\n{e}\n```\n\n<details><summary>Traceback</summary>\n\n```\n{tb}\n```\n</details>"
-              )
-              # An errored review should not silently pass.
-              pathlib.Path("review_blocking.txt").write_text("1")
-          PY
+        run: python .github/scripts/ai_reviewer.py
 
       # ------------------------------------------------------------------
-      # Always post a comment — even on failure — so you see the reason
+      # Post the review as a PR / commit comment.
       # ------------------------------------------------------------------
       - name: Post review comment
         if: always()
         uses: actions/github-script@v7
         env:
-          CHECKOUT: ${{ steps.checkout.outcome }}
-          SETUP_PY: ${{ steps.setup_python.outcome }}
-          INSTALL: ${{ steps.install.outcome }}
-          SMOKE_STATUS: ${{ env.SMOKE_STATUS }}
-          DIFF: ${{ steps.diff.outcome }}
-          SDK: ${{ steps.install_sdk.outcome }}
-          AI: ${{ steps.ai.outcome }}
+          CHECKOUT:      ${{ steps.checkout.outcome }}
+          SETUP_PY:      ${{ steps.setup_python.outcome }}
+          INSTALL:       ${{ steps.install.outcome }}
+          START:         ${{ steps.start_services.outcome }}
+          SMOKE_STATUS:  ${{ env.SMOKE_STATUS }}
+          DIFF:          ${{ steps.diff.outcome }}
+          AGENT:         ${{ steps.agent.outcome }}
         with:
           script: |
             const fs = require('fs');
@@ -350,12 +212,11 @@ jobs:
               : '✅ **No blocking issues found.**';
 
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-
             const smoke = process.env.SMOKE_STATUS === 'pass' ? '✅ pass' :
                           (process.env.SMOKE_STATUS === 'fail' ? '❌ fail' : '⏭️ skipped');
 
             const body = [
-              `## 🤖 AI Code Review`,
+              `## 🤖 Agentic AI Code Review`,
               ``,
               verdict,
               ``,
@@ -363,16 +224,17 @@ jobs:
               `|---|---|`,
               `| Checkout | ${mark(process.env.CHECKOUT)} |`,
               `| Set up Python | ${mark(process.env.SETUP_PY)} |`,
-              `| \`pip install -r requirements.txt\` | ${mark(process.env.INSTALL)} |`,
-              `| Full app run (backend + frontend + endpoints) | ${smoke} |`,
+              `| \`pip install\` | ${mark(process.env.INSTALL)} |`,
+              `| Start backend + frontend | ${mark(process.env.START)} |`,
+              `| Endpoint smoke tests | ${smoke} |`,
               `| Build diff | ${mark(process.env.DIFF)} |`,
-              `| Install Gemini SDK | ${mark(process.env.SDK)} |`,
-              `| Run Gemini review | ${mark(process.env.AI)} |`,
+              `| Agentic review (Gemini + tools) | ${mark(process.env.AGENT)} |`,
               ``,
               `---`,
               review,
               ``,
-              `<sub>Reviewed by Gemini using <code>.github/copilot-instructions.md</code>. `,
+              `<sub>Reviewed by an autonomous Gemini agent using tools (<code>read_file</code>, <code>list_dir</code>, <code>grep</code>, <code>call_endpoint</code>) `,
+              `and policy from <code>.github/copilot-instructions.md</code>. `,
               `Workflow run: <a href="${runUrl}">${context.runId}</a>.</sub>`,
             ].join('\n');
 
@@ -401,11 +263,28 @@ jobs:
             }
 
       # ------------------------------------------------------------------
-      # Final gate — fail the workflow (and therefore the PR check) if:
-      #   * the smoke test failed, or
-      #   * the AI review flagged [security] or [bug] issues.
-      # This step runs AFTER "Post review comment" so users still see the
-      # review before the red X appears.
+      # Stop background services (both "terminals" disconnect).
+      # Always runs — success or failure.
+      # ------------------------------------------------------------------
+      - name: Stop services
+        if: always()
+        run: |
+          echo "::group::Stop backend & frontend"
+          for f in uvicorn.pid gradio.pid; do
+            if [ -f "$f" ]; then
+              PID=$(cat "$f")
+              kill "$PID" 2>/dev/null || true
+              sleep 1
+              kill -9 "$PID" 2>/dev/null || true
+              echo "Killed $f (PID $PID)."
+            fi
+          done
+          echo "Both terminals disconnected."
+          echo "::endgroup::"
+
+      # ------------------------------------------------------------------
+      # Gate — fail the workflow (and the PR check) if either the smoke
+      # failed or the agent verdict was "block".
       # ------------------------------------------------------------------
       - name: Gate — fail on blocking issues
         if: always()
@@ -417,20 +296,17 @@ jobs:
             BLOCKING=$(cat review_blocking.txt)
           fi
           if [ "$SMOKE_STATUS" = "fail" ]; then
-            echo "::error::Smoke test failed — backend or frontend did not start. See the smoke step logs above."
+            echo "::error::Smoke test failed — backend or frontend did not respond correctly."
             exit 1
           fi
           if [ "$BLOCKING" = "1" ]; then
-            echo "::error::AI review reported blocking issues ([security] or [bug]). See the posted comment."
+            echo "::error::Agent verdict = block ([security] or [bug] findings). See the posted comment."
             exit 1
           fi
-          echo "No blocking issues."
+          echo "Agent verdict = allow. No blocking issues."
 
       # ------------------------------------------------------------------
-      # Notify collaborators by email when this job fails.
-      # Requires repo secrets: MAIL_SERVER, MAIL_PORT, MAIL_USERNAME,
-      # MAIL_PASSWORD. Recipients come from repo variable NOTIFY_EMAILS
-      # (comma-separated). If NOTIFY_EMAILS is empty the step is skipped.
+      # Email collaborators on failure.
       # ------------------------------------------------------------------
       - name: Email collaborators on failure
         if: failure() && vars.NOTIFY_EMAILS != ''
@@ -442,9 +318,9 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           from: "GitHub Actions <${{ secrets.MAIL_USERNAME }}>"
           to: ${{ vars.NOTIFY_EMAILS }}
-          subject: "[${{ github.repository }}] AI Code Review failed on ${{ github.ref_name }}"
+          subject: "[${{ github.repository }}] Agentic AI review failed on ${{ github.ref_name }}"
           body: |
-            The "AI Code Review" workflow failed — the change is blocked.
+            The "AI Code Review (Agentic)" workflow failed — the change is blocked.
 
             Repository: ${{ github.repository }}
             Branch:     ${{ github.ref_name }}
@@ -453,8 +329,8 @@ jobs:
             Smoke:      ${{ env.SMOKE_STATUS }}
 
             Likely reasons:
-              * Backend or frontend failed to boot (smoke test).
-              * Gemini reported [security] or [bug] findings.
+              * Backend or frontend failed to boot / respond (smoke test).
+              * The agent found [security] or [bug] issues in the diff.
 
-            View the run and full logs:
+            Full logs and posted review comment:
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
