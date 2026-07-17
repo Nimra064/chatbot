@@ -42,31 +42,75 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------------------
-      # Smoke test — start FastAPI backend and hit /health
+      # Smoke test — boot BOTH the FastAPI backend and the Gradio frontend
+      # and verify they each respond. If either fails the PR check goes red.
       # ------------------------------------------------------------------
-      - name: Smoke test — boot backend & hit /health
+      - name: Smoke test — boot backend + frontend
         id: smoke
-        # Do NOT continue-on-error: if the app cannot boot, the PR must fail.
+        # Do NOT continue-on-error: if either app cannot boot, the PR must fail.
         run: |
           set +e
+
+          FAIL=0
+
+          # --- Backend -----------------------------------------------------
+          echo "::group::Start backend (uvicorn :8000)"
           nohup uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
           UVICORN_PID=$!
-          for i in $(seq 1 15); do
+          BACKEND_OK=0
+          for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:8000/health > health.json 2>/dev/null; then
-              echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
+              echo "Backend /health OK:"
               cat health.json
-              kill $UVICORN_PID 2>/dev/null || true
-              exit 0
+              BACKEND_OK=1
+              break
             fi
             sleep 1
           done
-          echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
-          echo "---uvicorn.log---"
-          cat uvicorn.log || true
-          cp uvicorn.log smoke_error.log || true
+          if [ "$BACKEND_OK" -ne 1 ]; then
+            echo "::error::Backend failed to respond on http://127.0.0.1:8000/health"
+            echo "---uvicorn.log---"
+            cat uvicorn.log || true
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          # --- Frontend ----------------------------------------------------
+          echo "::group::Start frontend (Gradio :7860)"
+          # BACKEND_URL points the frontend at the backend we just started.
+          BACKEND_URL="http://127.0.0.1:8000" \
+            nohup python frontend/app.py > gradio.log 2>&1 &
+          GRADIO_PID=$!
+          FRONTEND_OK=0
+          for i in $(seq 1 30); do
+            # Gradio serves HTML on / once it is up.
+            if curl -fsS -o /dev/null http://127.0.0.1:7860/; then
+              echo "Frontend responded on http://127.0.0.1:7860/"
+              FRONTEND_OK=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$FRONTEND_OK" -ne 1 ]; then
+            echo "::error::Frontend failed to respond on http://127.0.0.1:7860/"
+            echo "---gradio.log---"
+            cat gradio.log || true
+            FAIL=1
+          fi
+          echo "::endgroup::"
+
+          # --- Cleanup -----------------------------------------------------
           kill $UVICORN_PID 2>/dev/null || true
-          # Fail the job so the PR check turns red.
-          exit 1
+          kill $GRADIO_PID  2>/dev/null || true
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
+            exit 0
+          else
+            echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
+            # Fail the job so the PR check turns red.
+            exit 1
+          fi
 
       # ------------------------------------------------------------------
       # Build diff
@@ -235,7 +279,7 @@ jobs:
               `| Checkout | ${mark(process.env.CHECKOUT)} |`,
               `| Set up Python | ${mark(process.env.SETUP_PY)} |`,
               `| \`pip install -r requirements.txt\` | ${mark(process.env.INSTALL)} |`,
-              `| Backend boots + \`/health\` responds | ${smoke} |`,
+              `| Backend + Frontend boot & respond | ${smoke} |`,
               `| Build diff | ${mark(process.env.DIFF)} |`,
               `| Install Gemini SDK | ${mark(process.env.SDK)} |`,
               `| Run Gemini review | ${mark(process.env.AI)} |`,
@@ -288,7 +332,7 @@ jobs:
             BLOCKING=$(cat review_blocking.txt)
           fi
           if [ "$SMOKE_STATUS" = "fail" ]; then
-            echo "::error::Smoke test failed — backend did not respond on /health."
+            echo "::error::Smoke test failed — backend or frontend did not start. See the smoke step logs above."
             exit 1
           fi
           if [ "$BLOCKING" = "1" ]; then
