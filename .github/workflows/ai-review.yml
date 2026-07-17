@@ -42,73 +42,158 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------------------
-      # Smoke test — boot BOTH the FastAPI backend and the Gradio frontend
-      # and verify they each respond. If either fails the PR check goes red.
+      # Smoke test — run the WHOLE app end-to-end:
+      #   * start FastAPI backend  in a background "terminal"
+      #   * start Gradio frontend in a background "terminal"
+      #   * hit every backend endpoint (GET /, GET /health, POST /chat)
+      #   * hit the frontend root and its Gradio /config endpoint
+      #   * any non-2xx / bad body -> fail the workflow (PR check goes red)
+      #   * both background processes are killed at the end either way
       # ------------------------------------------------------------------
-      - name: Smoke test — boot backend + frontend
+      - name: Smoke test — run whole app & hit every endpoint
         id: smoke
-        # Do NOT continue-on-error: if either app cannot boot, the PR must fail.
+        # Do NOT continue-on-error: if the app is broken, the PR must fail.
         run: |
           set +e
-
           FAIL=0
+          BACKEND_URL="http://127.0.0.1:8000"
+          FRONTEND_URL="http://127.0.0.1:7860"
 
-          # --- Backend -----------------------------------------------------
-          echo "::group::Start backend (uvicorn :8000)"
-          nohup uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
+          # Kill background procs on any exit path (success OR failure).
+          cleanup() {
+            echo "::group::Cleanup — stop backend & frontend"
+            [ -n "$UVICORN_PID" ] && kill "$UVICORN_PID" 2>/dev/null || true
+            [ -n "$GRADIO_PID"  ] && kill "$GRADIO_PID"  2>/dev/null || true
+            # Give them a moment to close ports cleanly.
+            sleep 1
+            [ -n "$UVICORN_PID" ] && kill -9 "$UVICORN_PID" 2>/dev/null || true
+            [ -n "$GRADIO_PID"  ] && kill -9 "$GRADIO_PID"  2>/dev/null || true
+            echo "Both terminals disconnected."
+            echo "::endgroup::"
+          }
+          trap cleanup EXIT
+
+          # ================================================================
+          # 1. Start backend (terminal 1)
+          # ================================================================
+          echo "::group::Terminal 1 — start backend (uvicorn :8000)"
+          nohup uvicorn backend.main:app --host 127.0.0.1 --port 8000 \
+                > uvicorn.log 2>&1 &
           UVICORN_PID=$!
-          BACKEND_OK=0
+          echo "uvicorn PID=$UVICORN_PID"
+
+          BACKEND_UP=0
           for i in $(seq 1 20); do
-            if curl -fsS http://127.0.0.1:8000/health > health.json 2>/dev/null; then
-              echo "Backend /health OK:"
-              cat health.json
-              BACKEND_OK=1
+            if curl -fsS "$BACKEND_URL/health" > health.json 2>/dev/null; then
+              BACKEND_UP=1
               break
             fi
             sleep 1
           done
-          if [ "$BACKEND_OK" -ne 1 ]; then
-            echo "::error::Backend failed to respond on http://127.0.0.1:8000/health"
-            echo "---uvicorn.log---"
-            cat uvicorn.log || true
+          if [ "$BACKEND_UP" -ne 1 ]; then
+            echo "::error title=Backend failed to start::uvicorn did not respond on $BACKEND_URL/health"
+            echo "---uvicorn.log---"; cat uvicorn.log || true
             FAIL=1
           fi
           echo "::endgroup::"
 
-          # --- Frontend ----------------------------------------------------
-          echo "::group::Start frontend (Gradio :7860)"
-          # BACKEND_URL points the frontend at the backend we just started.
-          BACKEND_URL="http://127.0.0.1:8000" \
-            nohup python frontend/app.py > gradio.log 2>&1 &
-          GRADIO_PID=$!
-          FRONTEND_OK=0
-          for i in $(seq 1 30); do
-            # Gradio serves HTML on / once it is up.
-            if curl -fsS -o /dev/null http://127.0.0.1:7860/; then
-              echo "Frontend responded on http://127.0.0.1:7860/"
-              FRONTEND_OK=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$FRONTEND_OK" -ne 1 ]; then
-            echo "::error::Frontend failed to respond on http://127.0.0.1:7860/"
-            echo "---gradio.log---"
-            cat gradio.log || true
-            FAIL=1
-          fi
-          echo "::endgroup::"
-
-          # --- Cleanup -----------------------------------------------------
-          kill $UVICORN_PID 2>/dev/null || true
-          kill $GRADIO_PID  2>/dev/null || true
-
+          # ================================================================
+          # 2. Start frontend (terminal 2)
+          # ================================================================
           if [ "$FAIL" -eq 0 ]; then
+            echo "::group::Terminal 2 — start frontend (Gradio :7860)"
+            BACKEND_URL="$BACKEND_URL" \
+              nohup python frontend/app.py > gradio.log 2>&1 &
+            GRADIO_PID=$!
+            echo "gradio PID=$GRADIO_PID"
+
+            FRONTEND_UP=0
+            for i in $(seq 1 30); do
+              if curl -fsS -o /dev/null "$FRONTEND_URL/"; then
+                FRONTEND_UP=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$FRONTEND_UP" -ne 1 ]; then
+              echo "::error title=Frontend failed to start::Gradio did not respond on $FRONTEND_URL/"
+              echo "---gradio.log---"; cat gradio.log || true
+              FAIL=1
+            fi
+            echo "::endgroup::"
+          fi
+
+          # ================================================================
+          # 3. Exercise every backend endpoint
+          # ================================================================
+          if [ "$FAIL" -eq 0 ]; then
+            echo "::group::Exercise backend endpoints"
+
+            # Helper: check_http <method> <url> [json-body] <expected-substring>
+            check_http() {
+              local method="$1" url="$2" body="$3" expect="$4"
+              local out code
+              if [ -n "$body" ]; then
+                out=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" \
+                          -H "Content-Type: application/json" \
+                          --data "$body" "$url")
+              else
+                out=$(curl -sS -o resp.txt -w "%{http_code}" -X "$method" "$url")
+              fi
+              code="$out"
+              echo "--> $method $url  =>  HTTP $code"
+              cat resp.txt; echo
+              if [ "$code" != "200" ]; then
+                echo "::error title=Endpoint failed::$method $url returned HTTP $code"
+                FAIL=1
+                return
+              fi
+              if [ -n "$expect" ] && ! grep -q "$expect" resp.txt; then
+                echo "::error title=Bad response body::$method $url response did not contain '$expect'"
+                FAIL=1
+              fi
+            }
+
+            check_http GET  "$BACKEND_URL/"        ""                                                    "Agentic AI Chatbot"
+            check_http GET  "$BACKEND_URL/health"  ""                                                    "healthy"
+            check_http POST "$BACKEND_URL/chat"    '{"message":"hi","history":[]}'                        "\"reply\""
+            check_http POST "$BACKEND_URL/chat"    '{"message":"what is your name?","history":[]}'       "\"model\""
+
+            echo "::endgroup::"
+          fi
+
+          # ================================================================
+          # 4. Exercise the frontend (Gradio serves /config as JSON once up)
+          # ================================================================
+          if [ "$FAIL" -eq 0 ]; then
+            echo "::group::Exercise frontend"
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$FRONTEND_URL/")
+            echo "--> GET $FRONTEND_URL/  =>  HTTP $code"
+            if [ "$code" != "200" ]; then
+              echo "::error title=Frontend root failed::GET / returned HTTP $code"
+              FAIL=1
+            fi
+            # /config is Gradio's internal JSON descriptor — proves the app graph loaded.
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$FRONTEND_URL/config")
+            echo "--> GET $FRONTEND_URL/config  =>  HTTP $code"
+            if [ "$code" != "200" ]; then
+              echo "::warning title=Gradio /config not 200::got HTTP $code (non-fatal)"
+            fi
+            echo "::endgroup::"
+          fi
+
+          # ================================================================
+          # 5. Verdict
+          # ================================================================
+          if [ "$FAIL" -eq 0 ]; then
+            echo "All endpoints returned OK — whole app is healthy."
             echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
             exit 0
           else
+            echo "One or more endpoints failed — see errors above."
             echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
-            # Fail the job so the PR check turns red.
+            echo "---uvicorn.log (tail)---"; tail -n 80 uvicorn.log 2>/dev/null || true
+            echo "---gradio.log  (tail)---"; tail -n 80 gradio.log  2>/dev/null || true
             exit 1
           fi
 
@@ -279,7 +364,7 @@ jobs:
               `| Checkout | ${mark(process.env.CHECKOUT)} |`,
               `| Set up Python | ${mark(process.env.SETUP_PY)} |`,
               `| \`pip install -r requirements.txt\` | ${mark(process.env.INSTALL)} |`,
-              `| Backend + Frontend boot & respond | ${smoke} |`,
+              `| Full app run (backend + frontend + endpoints) | ${smoke} |`,
               `| Build diff | ${mark(process.env.DIFF)} |`,
               `| Install Gemini SDK | ${mark(process.env.SDK)} |`,
               `| Run Gemini review | ${mark(process.env.AI)} |`,
