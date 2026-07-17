@@ -1,10 +1,7 @@
 name: AI Code Review
 
-# Runs on every push AND on every pull request (opened / new commits).
-# - Uses .github/copilot-instructions.md as the review guide.
-# - Runs the code (install + boot backend + hit /health).
-# - Reviews the diff with Gemini.
-# - Posts a commit comment (push) or a PR comment (pull_request).
+# Every step is resilient. The "post comment" step runs even if earlier
+# steps failed, so you always see WHY on the commit / PR.
 
 on:
   push:
@@ -22,38 +19,42 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history for diff)
+      - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+        continue-on-error: true
 
       - name: Set up Python
+        id: setup_python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+        continue-on-error: true
 
       - name: Install dependencies
         id: install
+        continue-on-error: true
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-        continue-on-error: true
 
       # ------------------------------------------------------------------
-      # Run the code: start FastAPI backend and hit /health
+      # Smoke test — start FastAPI backend and hit /health
       # ------------------------------------------------------------------
       - name: Smoke test — boot backend & hit /health
         id: smoke
         continue-on-error: true
         run: |
-          set -e
+          set +e
           nohup uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
           UVICORN_PID=$!
           for i in $(seq 1 15); do
             if curl -fsS http://127.0.0.1:8000/health > health.json 2>/dev/null; then
               echo "SMOKE_STATUS=pass" >> "$GITHUB_ENV"
               cat health.json
-              kill $UVICORN_PID || true
+              kill $UVICORN_PID 2>/dev/null || true
               exit 0
             fi
             sleep 1
@@ -61,14 +62,19 @@ jobs:
           echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
           echo "---uvicorn.log---"
           cat uvicorn.log || true
-          kill $UVICORN_PID || true
-          exit 1
+          # Save log so we can include it in the comment on failure
+          cp uvicorn.log smoke_error.log || true
+          kill $UVICORN_PID 2>/dev/null || true
+          exit 0  # do not fail the job — the post-comment step needs to run
 
       # ------------------------------------------------------------------
-      # Build the diff (works for both push and pull_request events)
+      # Build diff
       # ------------------------------------------------------------------
       - name: Build diff
+        id: diff
+        continue-on-error: true
         run: |
+          set +e
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
             HEAD="${{ github.event.pull_request.head.sha }}"
@@ -78,124 +84,156 @@ jobs:
           fi
 
           if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            git diff --unified=3 $(git hash-object -t tree /dev/null) "$HEAD" > diff.patch || true
+            git diff --unified=3 $(git hash-object -t tree /dev/null) "$HEAD" > diff.patch 2>diff_error.log
           else
-            git diff --unified=3 "$BASE" "$HEAD" > diff.patch || true
+            git diff --unified=3 "$BASE" "$HEAD" > diff.patch 2>diff_error.log
           fi
 
-          head -c 60000 diff.patch > diff.trimmed
-          mv diff.trimmed diff.patch
-          echo "Diff bytes: $(wc -c < diff.patch)"
+          head -c 60000 diff.patch > diff.trimmed 2>/dev/null || true
+          mv diff.trimmed diff.patch 2>/dev/null || true
+          echo "Diff bytes: $(wc -c < diff.patch 2>/dev/null || echo 0)"
 
       - name: Install Gemini SDK
+        id: install_sdk
+        continue-on-error: true
         run: pip install google-genai
 
       - name: AI review with Gemini
+        id: ai
+        continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-flash-latest' }}
         run: |
-          python <<'PY'
-          import os, pathlib, textwrap
-          from google import genai
+          python <<'PY' 2> ai_error.log || true
+          import os, pathlib, textwrap, traceback
 
-          api_key = os.environ.get("GEMINI_API_KEY")
-          if not api_key:
-              pathlib.Path("review.md").write_text(
-                  "## AI review skipped\n\n"
-                  "`GEMINI_API_KEY` secret is not set. "
-                  "Add it at Settings → Secrets and variables → Actions."
+          try:
+              api_key = os.environ.get("GEMINI_API_KEY")
+              if not api_key:
+                  pathlib.Path("review.md").write_text(
+                      "> ⚠️ **AI review skipped** — `GEMINI_API_KEY` secret is not set.\n"
+                      "> Add it at **Settings → Secrets and variables → Actions → New repository secret**."
+                  )
+                  raise SystemExit(0)
+
+              from google import genai
+
+              rules_path = pathlib.Path(".github/copilot-instructions.md")
+              rules_text = rules_path.read_text(encoding="utf-8") if rules_path.exists() else "(no rules file)"
+              diff_path = pathlib.Path("diff.patch")
+              diff = diff_path.read_text(encoding="utf-8", errors="replace") if diff_path.exists() else ""
+              if not diff.strip():
+                  pathlib.Path("review.md").write_text("_No diff to review._")
+                  raise SystemExit(0)
+
+              prompt = textwrap.dedent(f"""
+              You are a senior code reviewer for a FastAPI + Gradio + Gemini demo.
+              Follow the review rules below EXACTLY. Only flag issues the rules
+              tell you to flag. Be terse.
+
+              ===== REVIEW RULES =====
+              {rules_text}
+
+              ===== DIFF =====
+              {diff}
+
+              ===== OUTPUT FORMAT =====
+              Return Markdown with these sections (omit if empty):
+              ### [security]
+              - <issue> — file:line
+              ### [bug]
+              - <issue> — file:line
+              ### [style]
+              - <issue> — file:line
+              ### Summary
+              One or two sentences. If nothing to flag, say "LGTM".
+              """).strip()
+
+              client = genai.Client(api_key=api_key)
+              resp = client.models.generate_content(
+                  model=os.environ.get("GEMINI_MODEL", "gemini-flash-latest"),
+                  contents=prompt,
               )
-              raise SystemExit(0)
-
-          rules = pathlib.Path(".github/copilot-instructions.md")
-          rules_text = rules.read_text(encoding="utf-8") if rules.exists() else "(no rules file found)"
-          diff = pathlib.Path("diff.patch").read_text(encoding="utf-8", errors="replace")
-          if not diff.strip():
-              pathlib.Path("review.md").write_text("## AI review\n\nNo diff to review.")
-              raise SystemExit(0)
-
-          prompt = textwrap.dedent(f"""
-          You are a senior code reviewer for a FastAPI + Gradio + Gemini demo.
-          Follow the review rules below EXACTLY. Only comment on issues the
-          rules tell you to flag. Be terse.
-
-          ===== REVIEW RULES =====
-          {rules_text}
-
-          ===== DIFF =====
-          {diff}
-
-          ===== OUTPUT FORMAT =====
-          Return Markdown with these sections (omit a section if empty):
-
-          ### [security]
-          - <issue> — file:line
-
-          ### [bug]
-          - <issue> — file:line
-
-          ### [style]
-          - <issue> — file:line
-
-          ### Summary
-          One or two sentences on overall quality. If nothing to flag, say "LGTM".
-          """).strip()
-
-          client = genai.Client(api_key=api_key)
-          resp = client.models.generate_content(
-              model=os.environ.get("GEMINI_MODEL", "gemini-flash-latest"),
-              contents=prompt,
-          )
-          review = (resp.text or "").strip() or "_(Gemini returned no content.)_"
-          pathlib.Path("review.md").write_text(review, encoding="utf-8")
-          print(review)
+              review = (resp.text or "").strip() or "_(Gemini returned no content.)_"
+              pathlib.Path("review.md").write_text(review, encoding="utf-8")
+              print(review)
+          except SystemExit:
+              raise
+          except Exception as e:
+              tb = traceback.format_exc()
+              pathlib.Path("review.md").write_text(
+                  f"> ❌ **AI review errored:**\n\n```\n{e}\n```\n\n<details><summary>Traceback</summary>\n\n```\n{tb}\n```\n</details>"
+              )
           PY
 
       # ------------------------------------------------------------------
-      # Post the review: PR comment if this is a PR, commit comment otherwise
+      # Always post a comment — even on failure — so you see the reason
       # ------------------------------------------------------------------
       - name: Post review comment
+        if: always()
         uses: actions/github-script@v7
         env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          SETUP_PY: ${{ steps.setup_python.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
           SMOKE_STATUS: ${{ env.SMOKE_STATUS }}
-          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          DIFF: ${{ steps.diff.outcome }}
+          SDK: ${{ steps.install_sdk.outcome }}
+          AI: ${{ steps.ai.outcome }}
         with:
           script: |
             const fs = require('fs');
+            const mark = (s) => s === 'success' ? '✅' : (s === 'skipped' ? '⏭️' : '❌');
             const review = fs.existsSync('review.md')
               ? fs.readFileSync('review.md', 'utf8')
-              : '_(no review produced)_';
+              : '_(no review produced — see the workflow logs)_';
 
-            const smoke = process.env.SMOKE_STATUS === 'pass' ? '✅ pass' : '❌ fail';
-            const install = process.env.INSTALL_OUTCOME === 'success' ? '✅ pass' : '❌ fail';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const smoke = process.env.SMOKE_STATUS === 'pass' ? '✅ pass' :
+                          (process.env.SMOKE_STATUS === 'fail' ? '❌ fail' : '⏭️ skipped');
 
             const body = [
               `## 🤖 AI Code Review`,
               ``,
-              `| Check | Result |`,
+              `| Step | Status |`,
               `|---|---|`,
-              `| \`pip install -r requirements.txt\` | ${install} |`,
+              `| Checkout | ${mark(process.env.CHECKOUT)} |`,
+              `| Set up Python | ${mark(process.env.SETUP_PY)} |`,
+              `| \`pip install -r requirements.txt\` | ${mark(process.env.INSTALL)} |`,
               `| Backend boots + \`/health\` responds | ${smoke} |`,
+              `| Build diff | ${mark(process.env.DIFF)} |`,
+              `| Install Gemini SDK | ${mark(process.env.SDK)} |`,
+              `| Run Gemini review | ${mark(process.env.AI)} |`,
               ``,
               `---`,
               review,
               ``,
-              `<sub>Reviewed by Gemini using \`.github/copilot-instructions.md\`.</sub>`,
+              `<sub>Reviewed by Gemini using <code>.github/copilot-instructions.md</code>. `,
+              `Workflow run: <a href="${runUrl}">${context.runId}</a>.</sub>`,
             ].join('\n');
 
-            if (context.eventName === 'pull_request') {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body,
-              });
-            } else {
-              await github.rest.repos.createCommitComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: context.sha,
-                body,
-              });
+            try {
+              if (context.eventName === 'pull_request') {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body,
+                });
+              } else {
+                await github.rest.repos.createCommitComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: context.sha,
+                  body,
+                });
+              }
+              core.info('Comment posted.');
+            } catch (e) {
+              core.setFailed(
+                `Could not post comment: ${e.message}\n\n` +
+                `Fix: Settings → Actions → General → Workflow permissions → "Read and write permissions", then re-run.`
+              );
             }
