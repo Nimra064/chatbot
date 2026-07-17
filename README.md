@@ -8,7 +8,7 @@ A minimal **FastAPI (backend) + Gradio (frontend)** chatbot demo.
 ## Project Structure
 
 ```
-Copilot/
+chatbot/
 ├── backend/
 │   └── main.py          # FastAPI app  (/chat, /health)
 ├── frontend/
@@ -22,8 +22,8 @@ Copilot/
 ## Setup
 
 ```powershell
-# From the Copilot folder
-cd "C:\Users\RA_Nimra\Documents\Agentic AI Demo\Copilot"
+# From the chatbot folder
+cd "C:\Users\RA_Nimra\Documents\Agentic AI Demo\Nimra\chatbot"
 
 # 1. Create & activate a virtual env
 python -m venv .venv
@@ -39,7 +39,7 @@ Copy-Item .env.example .env
 
 ## Run
 
-Open **two terminals** in the `Copilot` folder:
+Open **two terminals** in the `chatbot` folder:
 
 **Terminal 1 — backend (FastAPI):**
 ```powershell
