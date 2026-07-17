@@ -37,7 +37,6 @@ jobs:
 
       - name: Install dependencies
         id: install
-        continue-on-error: true
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -47,7 +46,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Smoke test — boot backend & hit /health
         id: smoke
-        continue-on-error: true
+        # Do NOT continue-on-error: if the app cannot boot, the PR must fail.
         run: |
           set +e
           nohup uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
@@ -64,16 +63,18 @@ jobs:
           echo "SMOKE_STATUS=fail" >> "$GITHUB_ENV"
           echo "---uvicorn.log---"
           cat uvicorn.log || true
-          # Save log so we can include it in the comment on failure
           cp uvicorn.log smoke_error.log || true
           kill $UVICORN_PID 2>/dev/null || true
-          exit 0  # do not fail the job — the post-comment step needs to run
+          # Fail the job so the PR check turns red.
+          exit 1
 
       # ------------------------------------------------------------------
       # Build diff
       # ------------------------------------------------------------------
       - name: Build diff
         id: diff
+        # Always run — even if smoke failed — so the comment shows what changed.
+        if: always()
         continue-on-error: true
         run: |
           set +e
@@ -97,11 +98,13 @@ jobs:
 
       - name: Install Gemini SDK
         id: install_sdk
+        if: always()
         continue-on-error: true
         run: pip install google-genai
 
       - name: AI review with Gemini
         id: ai
+        if: always()
         continue-on-error: true
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -160,6 +163,24 @@ jobs:
               review = (resp.text or "").strip() or "_(Gemini returned no content.)_"
               pathlib.Path("review.md").write_text(review, encoding="utf-8")
               print(review)
+
+              # Decide whether the review contains blocking findings.
+              # A section header like "### [security]" or "### [bug]" that is
+              # followed by at least one bullet counts as blocking.
+              import re
+              blocking = False
+              for tag in ("security", "bug"):
+                  pattern = (
+                      rf"^#+\s*\[{tag}\]\s*$"
+                      r"(?P<body>.*?)"
+                      r"(?=^#+\s|\Z)"
+                  )
+                  m = re.search(pattern, review, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
+                  if m and re.search(r"^\s*[-*]\s+\S", m.group("body"), flags=re.MULTILINE):
+                      blocking = True
+                      break
+              pathlib.Path("review_blocking.txt").write_text("1" if blocking else "0")
+              print(f"BLOCKING={blocking}")
           except SystemExit:
               raise
           except Exception as e:
@@ -167,6 +188,8 @@ jobs:
               pathlib.Path("review.md").write_text(
                   f"> ❌ **AI review errored:**\n\n```\n{e}\n```\n\n<details><summary>Traceback</summary>\n\n```\n{tb}\n```\n</details>"
               )
+              # An errored review should not silently pass.
+              pathlib.Path("review_blocking.txt").write_text("1")
           PY
 
       # ------------------------------------------------------------------
@@ -190,6 +213,12 @@ jobs:
             const review = fs.existsSync('review.md')
               ? fs.readFileSync('review.md', 'utf8')
               : '_(no review produced — see the workflow logs)_';
+            const blocking = fs.existsSync('review_blocking.txt')
+              && fs.readFileSync('review_blocking.txt', 'utf8').trim() === '1';
+            const smokeFailed = process.env.SMOKE_STATUS === 'fail';
+            const verdict = (blocking || smokeFailed)
+              ? '❌ **This change is blocked** — fix the issues below and push again.'
+              : '✅ **No blocking issues found.**';
 
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
@@ -198,6 +227,8 @@ jobs:
 
             const body = [
               `## 🤖 AI Code Review`,
+              ``,
+              verdict,
               ``,
               `| Step | Status |`,
               `|---|---|`,
@@ -239,3 +270,29 @@ jobs:
                 `Fix: Settings → Actions → General → Workflow permissions → "Read and write permissions", then re-run.`
               );
             }
+
+      # ------------------------------------------------------------------
+      # Final gate — fail the workflow (and therefore the PR check) if:
+      #   * the smoke test failed, or
+      #   * the AI review flagged [security] or [bug] issues.
+      # This step runs AFTER "Post review comment" so users still see the
+      # review before the red X appears.
+      # ------------------------------------------------------------------
+      - name: Gate — fail on blocking issues
+        if: always()
+        env:
+          SMOKE_STATUS: ${{ env.SMOKE_STATUS }}
+        run: |
+          BLOCKING=0
+          if [ -f review_blocking.txt ]; then
+            BLOCKING=$(cat review_blocking.txt)
+          fi
+          if [ "$SMOKE_STATUS" = "fail" ]; then
+            echo "::error::Smoke test failed — backend did not respond on /health."
+            exit 1
+          fi
+          if [ "$BLOCKING" = "1" ]; then
+            echo "::error::AI review reported blocking issues ([security] or [bug]). See the posted comment."
+            exit 1
+          fi
+          echo "No blocking issues."
