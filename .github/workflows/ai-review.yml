@@ -300,7 +300,7 @@ jobs:
             exit 1
           fi
           if [ "$BLOCKING" = "1" ]; then
-            echo "::error::Agent verdict = block ([security] or [bug] findings). See the posted comment."
+            echo "::error::Agent verdict = block (missing GEMINI_API_KEY, agent error, or [security]/[bug] findings). See the posted comment."
             exit 1
           fi
           echo "Agent verdict = allow. No blocking issues."

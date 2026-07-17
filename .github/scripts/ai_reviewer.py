@@ -351,9 +351,12 @@ def main() -> int:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         write_outputs(
-            "> ⚠️ **Agentic review skipped** — `GEMINI_API_KEY` secret is not set.",
-            blocking=False,
-            verdict={"verdict": "skip", "findings": []},
+            "> ❌ **Change blocked** — `GEMINI_API_KEY` secret is not set.\n"
+            "> The agentic reviewer is mandatory. Add the secret at "
+            "**Settings → Secrets and variables → Actions → New repository secret** "
+            "and re-run this workflow.",
+            blocking=True,
+            verdict={"verdict": "block", "reason": "missing_api_key", "findings": []},
         )
         return 0
 
