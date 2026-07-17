@@ -34,3 +34,31 @@ jobs:
               --title "$BRANCH" \
               --body "Auto-opened by CI. GitHub Copilot code review will run on this PR."
           fi
+
+      # ------------------------------------------------------------------
+      # Notify collaborators by email when this job fails.
+      # Requires repo secrets: MAIL_SERVER, MAIL_PORT, MAIL_USERNAME,
+      # MAIL_PASSWORD. Recipients come from repo variable NOTIFY_EMAILS
+      # (comma-separated). If NOTIFY_EMAILS is empty the step is skipped.
+      # ------------------------------------------------------------------
+      - name: Email collaborators on failure
+        if: failure() && vars.NOTIFY_EMAILS != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: "GitHub Actions <${{ secrets.MAIL_USERNAME }}>"
+          to: ${{ vars.NOTIFY_EMAILS }}
+          subject: "[${{ github.repository }}] Auto-open PR failed on ${{ github.ref_name }}"
+          body: |
+            The "Auto-open PR for Copilot review" workflow failed.
+
+            Repository: ${{ github.repository }}
+            Branch:     ${{ github.ref_name }}
+            Commit:     ${{ github.sha }}
+            Actor:      ${{ github.actor }}
+
+            View the run and logs:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
