@@ -1,0 +1,36 @@
+name: Auto-open PR for Copilot review
+
+# Every push to a non-main branch opens (or updates) a PR into main.
+# Once the PR exists, GitHub Copilot code review (enabled in repo settings)
+# will automatically review the diff and post comments.
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Open PR to main if none exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            echo "PR already exists for $BRANCH — Copilot will re-review the new commits automatically."
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "$BRANCH" \
+              --body "Auto-opened by CI. GitHub Copilot code review will run on this PR."
+          fi
