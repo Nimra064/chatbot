@@ -37,6 +37,7 @@ jobs:
 
       # ------------------------------------------------------------------
       # Notify collaborators by email when this job fails.
+      # Requires repo secrets: MAIL_SERVER, MAIL_PORT, MAIL_USERNAME,
       # MAIL_PASSWORD. Recipients come from repo variable NOTIFY_EMAILS
       # (comma-separated). If NOTIFY_EMAILS is empty the step is skipped.
       # ------------------------------------------------------------------
