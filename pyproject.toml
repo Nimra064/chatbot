@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "venv", ".github"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # line length is handled by the formatter
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = "(\\.venv|venv|\\.github)"
