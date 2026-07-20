@@ -111,7 +111,7 @@ def gemini_reply(message: str, history: list[Message]) -> str | None:
 
         response = client.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-flash-latest"),
-            contents=contents,
+            contents=contents,  # type: ignore[arg-type]
             config=types.GenerateContentConfig(
                 system_instruction="You are a helpful assistant.",
                 temperature=0.7,
