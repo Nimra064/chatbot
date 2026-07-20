@@ -57,22 +57,20 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 RULES = [
-    (("hi", "hello", "hey", "salam", "assalam"),
-     ["Hello! How can I help you today?",
-      "Hi there! What would you like to talk about?",
-      "Hey! I'm your demo assistant. Ask me anything."]),
-    (("how are you", "how r u"),
-     ["I'm just code, but I'm running smoothly! How about you?"]),
-    (("your name", "who are you"),
-     ["I'm the Agentic AI Demo Bot, powered by FastAPI + Gradio."]),
-    (("time",),
-     [f"Server time is {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]),
-    (("bye", "goodbye", "exit"),
-     ["Goodbye! Have a great day.", "See you later!"]),
-    (("thanks", "thank you"),
-     ["You're welcome!", "Anytime!"]),
-    (("help",),
-     ["I can chat with you. Try asking about the time, my name, or just say hi!"]),
+    (
+        ("hi", "hello", "hey", "salam", "assalam"),
+        [
+            "Hello! How can I help you today?",
+            "Hi there! What would you like to talk about?",
+            "Hey! I'm your demo assistant. Ask me anything.",
+        ],
+    ),
+    (("how are you", "how r u"), ["I'm just code, but I'm running smoothly! How about you?"]),
+    (("your name", "who are you"), ["I'm the Agentic AI Demo Bot, powered by FastAPI + Gradio."]),
+    (("time",), [f"Server time is {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]),
+    (("bye", "goodbye", "exit"), ["Goodbye! Have a great day.", "See you later!"]),
+    (("thanks", "thank you"), ["You're welcome!", "Anytime!"]),
+    (("help",), ["I can chat with you. Try asking about the time, my name, or just say hi!"]),
 ]
 
 
@@ -84,7 +82,7 @@ def rule_based_reply(message: str) -> str:
         if any(k in msg for k in keywords):
             return random.choice(replies)
     return (
-        f"You said: \"{message}\". "
+        f'You said: "{message}". '
         "I'm a simple demo bot — set OPENAI_API_KEY to enable smarter replies."
     )
 
@@ -92,6 +90,7 @@ def rule_based_reply(message: str) -> str:
 # ---------------------------------------------------------------------------
 # Optional Gemini-powered reply
 # ---------------------------------------------------------------------------
+
 
 def gemini_reply(message: str, history: list[Message]) -> str | None:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -107,12 +106,8 @@ def gemini_reply(message: str, history: list[Message]) -> str | None:
         contents = []
         for m in history:
             role = "user" if m.role == "user" else "model"
-            contents.append(
-                types.Content(role=role, parts=[types.Part.from_text(text=m.content)])
-            )
-        contents.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=message)])
-        )
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m.content)]))
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
 
         response = client.models.generate_content(
             model=os.getenv("GEMINI_MODEL", "gemini-flash-latest"),
@@ -130,6 +125,7 @@ def gemini_reply(message: str, history: list[Message]) -> str | None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
 
 @app.get("/")
 def root():
