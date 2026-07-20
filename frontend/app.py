@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-# typing import Any, Dict, List
+from typing import Any
 
 import gradio as gr
 import requests
@@ -11,21 +11,21 @@ import requests
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 
-def chat_fn(message: str, history: List[Any]) -> str:
+def chat_fn(message: str, history: list[Any]) -> str:
     """Send the user message + history to the FastAPI backend and return reply.
 
     Supports both Gradio history formats:
       - "messages":  [{"role": "user"|"assistant", "content": "..."}]
       - "tuples":    [(user_msg, bot_msg), ...]
     """
-    api_history: List[Dict[str, str]] = []
+    api_history: list[dict[str, str]] = []
     for item in history or []:
         if isinstance(item, dict):
             role = item.get("role")
             content = item.get("content") or ""
             if role in ("user", "assistant") and content:
                 api_history.append({"role": role, "content": content})
-        elif isinstance(item, (list, tuple)) and len(item) == 2:
+        elif isinstance(item, list | tuple) and len(item) == 2:
             user_msg, bot_msg = item
             if user_msg:
                 api_history.append({"role": "user", "content": str(user_msg)})

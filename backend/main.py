@@ -11,7 +11,6 @@ import os
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -44,7 +43,7 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., description="Latest user message")
-    history: List[Message] = Field(default_factory=list)
+    history: list[Message] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -94,7 +93,7 @@ def rule_based_reply(message: str) -> str:
 # Optional Gemini-powered reply
 # ---------------------------------------------------------------------------
 
-def gemini_reply(message: str, history: List[Message]) -> Optional[str]:
+def gemini_reply(message: str, history: list[Message]) -> str | None:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
