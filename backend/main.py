@@ -12,11 +12,12 @@ import os
 import random
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +61,28 @@ app.add_middleware(
 class Message(BaseModel):
     role: str = Field(..., description="'user' or 'assistant'")
     content: str
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_content(cls, value: Any) -> str:
+        """Accept Gradio-style content (str | list of parts | dict) and flatten to str."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for part in value:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+                else:
+                    parts.append(str(part))
+            return "".join(p for p in parts if p)
+        if isinstance(value, dict):
+            return str(value.get("text") or value.get("content") or "")
+        return str(value)
 
 
 class ChatRequest(BaseModel):

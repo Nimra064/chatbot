@@ -19,6 +19,34 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 logger.info("Frontend will call backend at %s", BACKEND_URL)
 
 
+def _content_to_text(content: Any) -> str:
+    """Normalize Gradio's `content` field to a plain string.
+
+    Gradio may send content as:
+      - a plain string:   "Hello!"
+      - a list of parts:  [{"type": "text", "text": "Hello!"}, ...]
+      - a dict part:      {"type": "text", "text": "Hello!"}
+    Anything else is coerced with str().
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            elif isinstance(part, str):
+                parts.append(part)
+            else:
+                parts.append(str(part))
+        return "".join(p for p in parts if p)
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    return str(content)
+
+
 def chat_fn(message: str, history: list[Any]) -> str:
     """Send the user message + history to the FastAPI backend and return reply.
 
@@ -30,15 +58,15 @@ def chat_fn(message: str, history: list[Any]) -> str:
     for item in history or []:
         if isinstance(item, dict):
             role = item.get("role")
-            content = item.get("content") or ""
+            content = _content_to_text(item.get("content"))
             if role in ("user", "assistant") and content:
                 api_history.append({"role": role, "content": content})
         elif isinstance(item, list | tuple) and len(item) == 2:
             user_msg, bot_msg = item
             if user_msg:
-                api_history.append({"role": "user", "content": str(user_msg)})
+                api_history.append({"role": "user", "content": _content_to_text(user_msg)})
             if bot_msg:
-                api_history.append({"role": "assistant", "content": str(bot_msg)})
+                api_history.append({"role": "assistant", "content": _content_to_text(bot_msg)})
 
     try:
         resp = requests.post(
