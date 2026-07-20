@@ -7,18 +7,39 @@ works out of the box.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
-# from datetime import datetime
-# from pathlib import Path
+from datetime import datetime
+from pathlib import Path
 
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("chatbot.backend")
+
 # Load .env from the project root (parent of backend/)
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+if ENV_PATH.is_file():
+    load_dotenv(ENV_PATH)
+    logger.info("Loaded environment from %s", ENV_PATH)
+else:
+    logger.warning(
+        "No .env file found at %s \u2014 falling back to process environment. "
+        "Copy .env.example to .env and set GEMINI_API_KEY to enable Gemini replies.",
+        ENV_PATH,
+    )
+
+if os.getenv("GEMINI_API_KEY"):
+    logger.info("GEMINI_API_KEY is set \u2014 Gemini replies enabled.")
+else:
+    logger.warning("GEMINI_API_KEY is not set \u2014 using the rule-based fallback bot.")
 
 app = FastAPI(
     title="Agentic AI Chatbot API",
@@ -99,7 +120,11 @@ def gemini_reply(message: str, history: list[Message]) -> str | None:
     try:
         from google import genai  # type: ignore
         from google.genai import types  # type: ignore
+    except ImportError as exc:
+        logger.error("google-genai package is not installed: %s", exc)
+        return f"(Gemini unavailable: package not installed \u2014 {exc})"
 
+    try:
         client = genai.Client(api_key=api_key)
 
         # Gemini expects roles 'user' and 'model'.
@@ -119,7 +144,8 @@ def gemini_reply(message: str, history: list[Message]) -> str | None:
         )
         return (response.text or "").strip()
     except Exception as exc:  # pragma: no cover - demo fallback
-        return f"(Gemini error, falling back) {exc}"
+        logger.exception("Gemini call failed (%s)", type(exc).__name__)
+        return f"(Gemini error: {type(exc).__name__} \u2014 {exc})"
 
 
 # ---------------------------------------------------------------------------

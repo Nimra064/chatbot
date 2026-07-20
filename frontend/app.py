@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 import gradio as gr
 import requests
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("chatbot.frontend")
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+logger.info("Frontend will call backend at %s", BACKEND_URL)
 
 
 def chat_fn(message: str, history: list[Any]) -> str:
@@ -41,13 +49,26 @@ def chat_fn(message: str, history: list[Any]) -> str:
         resp.raise_for_status()
         data = resp.json()
         return data.get("reply", "(no reply)")
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as exc:
+        logger.error("Cannot reach backend at %s: %s", BACKEND_URL, exc)
         return (
             f"Cannot reach backend at {BACKEND_URL}. "
             "Start it with:  uvicorn backend.main:app --reload"
         )
+    except requests.exceptions.Timeout as exc:
+        logger.error("Backend request timed out after 30s: %s", exc)
+        return "Backend timed out after 30 seconds. Try again or check backend logs."
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        body = exc.response.text[:300] if exc.response is not None else ""
+        logger.error("Backend returned HTTP %s: %s", status, body)
+        return f"Backend returned HTTP {status}. Details: {body}"
+    except ValueError as exc:  # invalid JSON in response
+        logger.exception("Backend response was not valid JSON")
+        return f"Backend returned invalid JSON: {exc}"
     except Exception as exc:
-        return f"Error: {exc}"
+        logger.exception("Unexpected error calling backend (%s)", type(exc).__name__)
+        return f"Unexpected error ({type(exc).__name__}): {exc}"
 
 
 with gr.Blocks(title="Agentic AI Chatbot Demo", theme=gr.themes.Soft()) as demo:
